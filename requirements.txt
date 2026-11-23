@@ -4,5 +4,4 @@ Pillow
 numpy
 phonenumbers
 torch
-torchvision
 transformers
