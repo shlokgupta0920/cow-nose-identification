@@ -1,3 +1,7 @@
 streamlit
 Pillow
-opencv-python-headless
+numpy
+phonenumbers
+torch
+torchvision
+transformers
