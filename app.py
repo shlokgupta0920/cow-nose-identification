@@ -3,10 +3,10 @@ import streamlit as st
 import os
 import json
 import hashlib
-import io
-import cv2
+import re
 import numpy as np
 from PIL import Image, ImageOps
+from io import BytesIO
 
 # ---------------- CONFIGURATION ----------------
 
@@ -21,12 +21,24 @@ IMAGE_FOLDER = "cow_images"
 
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
 
+
 # ---------------- DATABASE FUNCTIONS ----------------
 
 def load_cows():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as file:
-            return json.load(file)
+            cows = json.load(file)
+
+        # Older records ke missing fields
+        for cow in cows:
+            cow.setdefault("age", "")
+            cow.setdefault("owner", "")
+            cow.setdefault("contact", "")
+            cow.setdefault("address", "")
+            cow.setdefault("breed", "")
+
+        return cows
+
     return []
 
 
@@ -35,102 +47,94 @@ def save_cows(cows):
         json.dump(cows, file, indent=4)
 
 
-def get_image_hash(image_bytes):
-    return hashlib.sha256(image_bytes).hexdigest()
+# ---------------- IMAGE MATCHING ----------------
 
+def get_phash(image_bytes):
+    """
+    Perceptual hash:
+    Similar-looking images ko compare karne ke liye.
+    """
 
-# ---------------- IMAGE PROCESSING ----------------
+    image = Image.open(BytesIO(image_bytes))
+    image = ImageOps.exif_transpose(image).convert("L")
+    image = image.resize((32, 32))
 
-def image_to_gray(image_bytes):
-    image = Image.open(io.BytesIO(image_bytes))
-    image = ImageOps.exif_transpose(image).convert("RGB")
+    pixels = np.asarray(image, dtype=np.float64)
 
-    image_array = np.array(image)
-
-    gray = cv2.cvtColor(
-        image_array,
-        cv2.COLOR_RGB2GRAY
+    # DCT calculation
+    n = 32
+    x = np.arange(n)
+    dct_matrix = np.cos(
+        np.pi * (2 * x[:, None] + 1) * x[None, :] / (2 * n)
     )
 
-    return gray
+    dct_matrix[:, 0] *= 1 / np.sqrt(2)
+    dct_matrix *= np.sqrt(2 / n)
+
+    dct = dct_matrix @ pixels @ dct_matrix.T
+
+    low_freq = dct[:8, :8]
+    median = np.median(low_freq.flatten()[1:])
+
+    bits = low_freq > median
+
+    return "".join("1" if bit else "0" for bit in bits.flatten())
 
 
-def compare_images(query_bytes, registered_bytes):
+def hash_distance(hash1, hash2):
+    if not hash1 or not hash2 or len(hash1) != len(hash2):
+        return 999
 
-    query_gray = image_to_gray(query_bytes)
-    registered_gray = image_to_gray(registered_bytes)
-
-    orb = cv2.ORB_create(nfeatures=1500)
-
-    keypoints1, descriptors1 = orb.detectAndCompute(
-        query_gray, None
-    )
-
-    keypoints2, descriptors2 = orb.detectAndCompute(
-        registered_gray, None
-    )
-
-    if descriptors1 is None or descriptors2 is None:
-        return 0
-
-    if len(descriptors1) < 2 or len(descriptors2) < 2:
-        return 0
-
-    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
-
-    matches = matcher.knnMatch(
-        descriptors1,
-        descriptors2,
-        k=2
-    )
-
-    good_matches = []
-
-    for pair in matches:
-        if len(pair) == 2:
-            first, second = pair
-
-            if first.distance < 0.75 * second.distance:
-                good_matches.append(first)
-
-    return len(good_matches)
+    return sum(a != b for a, b in zip(hash1, hash2))
 
 
-def find_matching_cow(query_bytes, cows):
+def find_matching_cow(image_bytes, cows, threshold=10):
+    try:
+        test_hash = get_phash(image_bytes)
+    except Exception:
+        return None
 
-    best_cow = None
-    best_score = 0
+    best_match = None
+    best_distance = 999
 
     for cow in cows:
+        stored_hash = cow.get("phash", "")
 
-        image_path = cow.get("image")
-
-        if not image_path or not os.path.exists(image_path):
+        if not stored_hash:
             continue
 
-        try:
-            with open(image_path, "rb") as file:
-                registered_bytes = file.read()
+        distance = hash_distance(test_hash, stored_hash)
 
-            score = compare_images(
-                query_bytes,
-                registered_bytes
-            )
+        if distance < best_distance:
+            best_distance = distance
+            best_match = cow
 
-            if score > best_score:
-                best_score = score
-                best_cow = cow
+    if best_distance <= threshold:
+        return best_match
 
-        except Exception as error:
-            st.warning(
-                f"Could not process image for {cow.get('id')}: {error}"
-            )
+    return None
 
-    # Initial prototype threshold; needs testing with real samples.
-    if best_score >= 8:
-        return best_cow, best_score
 
-    return None, best_score
+# ---------------- DISPLAY COW DETAILS ----------------
+
+def display_cow_details(cow):
+    st.subheader("🐄 Cow Details")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.write("**Cow ID:**", cow["id"])
+        st.write("**Cow Name:**", cow["name"])
+        st.write("**Age:**", cow.get("age", ""))
+        st.write("**Breed:**", cow.get("breed", ""))
+
+    with col2:
+        st.write("**Owner Name:**", cow.get("owner", ""))
+        st.write("**Contact Number:**", cow.get("contact", ""))
+        st.write("**Address:**", cow.get("address", ""))
+
+    if os.path.exists(cow["image"]):
+        st.image(cow["image"], width=300)
 
 
 # ---------------- APP DESIGN ----------------
@@ -161,205 +165,165 @@ with register_tab:
 
     st.header("Register New Cow")
 
-    cow_id = st.text_input("Cow ID")
+    with st.form("register_form"):
 
-    cow_name = st.text_input("Cow Name")
+        col1, col2 = st.columns(2)
 
-    cow_image = st.file_uploader(
-        "Upload Cow Nose Image",
-        type=["jpg", "jpeg", "png"],
-        key="register_image"
-    )
+        with col1:
+            cow_id = st.text_input("Cow ID")
+            cow_name = st.text_input("Cow Name")
+            age = st.text_input("Age (e.g. 3 years)")
+            breed = st.text_input("Breed")
 
-    if cow_image:
-        st.image(
-            cow_image,
-            caption="Uploaded Nose Image",
-            width=300
+        with col2:
+            owner = st.text_input("Owner Name")
+            contact = st.text_input("Contact Number")
+            address = st.text_area("Address")
+
+        cow_image = st.file_uploader(
+            "Upload Cow Nose Image",
+            type=["jpg", "jpeg", "png"],
+            key="register_image"
         )
 
-    if st.button("Register Cow", type="primary"):
+        submitted = st.form_submit_button(
+            "Register Cow",
+            type="primary"
+        )
 
-        if not cow_id or not cow_name or not cow_image:
+        if submitted:
 
-            st.warning(
-                "Please fill all details and upload an image."
-            )
+            cow_id = cow_id.strip()
+            cow_name = cow_name.strip()
 
-        elif any(c["id"] == cow_id for c in cows):
+            if not all([
+                cow_id, cow_name, age.strip(),
+                breed.strip(), owner.strip(),
+                contact.strip(), address.strip(), cow_image
+            ]):
+                st.warning("Please fill all details and upload an image.")
 
-            st.error("This Cow ID is already registered.")
+            elif any(c["id"] == cow_id for c in cows):
+                st.error("This Cow ID is already registered.")
 
-        else:
-
-            image_bytes = cow_image.getvalue()
-            image_hash = get_image_hash(image_bytes)
-
-            if any(
-                c.get("image_hash") == image_hash
-                for c in cows
-            ):
-
-                st.error("This exact image is already registered.")
+            elif not contact.strip().isdigit():
+                st.error("Enter a valid contact number.")
 
             else:
+                image_bytes = cow_image.getvalue()
 
-                image_path = os.path.join(
-                    IMAGE_FOLDER,
-                    f"{cow_id}.jpg"
-                )
+                try:
+                    image_hash = get_phash(image_bytes)
 
-                with open(image_path, "wb") as file:
-                    file.write(image_bytes)
+                    if any(
+                        c.get("phash") == image_hash for c in cows
+                    ):
+                        st.error("This image is already registered.")
 
-                cows.append({
-                    "id": cow_id,
-                    "name": cow_name,
-                    "image": image_path,
-                    "image_hash": image_hash
-                })
+                    else:
+                        safe_id = re.sub(
+                            r"[^a-zA-Z0-9_-]", "_", cow_id
+                        )
 
-                save_cows(cows)
+                        image_path = os.path.join(
+                            IMAGE_FOLDER,
+                            f"{safe_id}.jpg"
+                        )
 
-                st.success(
-                    f"Cow {cow_name} registered successfully!"
-                )
+                        image = Image.open(BytesIO(image_bytes))
+                        image = ImageOps.exif_transpose(image).convert("RGB")
+                        image.save(image_path, format="JPEG")
+
+                        new_cow = {
+                            "id": cow_id,
+                            "name": cow_name,
+                            "age": age.strip(),
+                            "owner": owner.strip(),
+                            "contact": contact.strip(),
+                            "address": address.strip(),
+                            "breed": breed.strip(),
+                            "image": image_path,
+                            "phash": image_hash
+                        }
+
+                        cows.append(new_cow)
+                        save_cows(cows)
+
+                        st.success(
+                            f"Cow {cow_name} registered successfully!"
+                        )
+
+                except Exception as e:
+                    st.error(f"Registration error: {e}")
+
+    if cow_image:
+        st.image(cow_image, caption="Uploaded Cow Nose Image", width=300)
 
 
-# ---------------- UPLOAD IDENTIFICATION ----------------
+# ---------------- IDENTIFY COW ----------------
 
 with identify_tab:
 
-    st.header("Identify Cow Using Image Upload")
+    st.header("Identify Cow")
+
+    st.write("Upload a cow nose image to find its registered details.")
 
     test_image = st.file_uploader(
-        "Choose Cow Nose Image",
+        "Choose Nose Image",
         type=["jpg", "jpeg", "png"],
         key="identify_image"
     )
 
     if test_image:
 
-        st.image(
-            test_image,
-            caption="Image to Identify",
-            width=300
-        )
+        st.image(test_image, caption="Image to Identify", width=300)
 
         if st.button("Identify Cow", type="primary"):
 
-            if not cows:
+            match = find_matching_cow(
+                test_image.getvalue(), cows
+            )
 
-                st.warning("No registered cows available.")
+            if match:
+                st.success("Matching Cow Found!")
+                display_cow_details(match)
 
             else:
-
-                with st.spinner("Comparing images..."):
-
-                    match, score = find_matching_cow(
-                        test_image.getvalue(),
-                        cows
-                    )
-
-                if match:
-
-                    st.success("Matching Cow Found!")
-
-                    st.subheader("Cow Details")
-
-                    st.write("**Cow ID:**", match["id"])
-                    st.write("**Cow Name:**", match["name"])
-                    st.write("**Feature Matches:**", score)
-
-                    if os.path.exists(match["image"]):
-                        st.image(
-                            match["image"],
-                            caption="Registered Cow Image",
-                            width=300
-                        )
-
-                else:
-
-                    st.error("No Matching Cow Found.")
-
-                    st.write(
-                        "Best feature match score:",
-                        score
-                    )
+                st.error("No Matching Cow Found.")
 
 
 # ---------------- CAMERA SCAN ----------------
 
 with camera_tab:
 
-    st.header("📷 Scan Cow Nose Using Camera")
+    st.header("📷 Live Camera Scan")
 
     st.write(
-        "Use your phone or laptop camera to scan a printed cow nose image."
+        "Phone camera se registered cow ki printed nose image scan karein."
     )
 
-    camera_image = st.camera_input(
-        "Open Camera and Capture Cow Nose"
-    )
+    camera_image = st.camera_input("Open Camera and Scan Cow Nose")
 
     if camera_image:
 
+        image_bytes = camera_image.getvalue()
+
         st.image(
-            camera_image,
-            caption="Captured Cow Nose Image",
-            width=400
+            image_bytes,
+            caption="Captured Image",
+            width=350
         )
 
         if st.button("Scan and Identify Cow", type="primary"):
 
-            if not cows:
+            match = find_matching_cow(image_bytes, cows)
 
-                st.warning("No registered cows available.")
+            if match:
+                st.success("Matching Cow Found!")
+                display_cow_details(match)
 
             else:
-
-                with st.spinner(
-                    "AI image matching in progress..."
-                ):
-
-                    match, score = find_matching_cow(
-                        camera_image.getvalue(),
-                        cows
-                    )
-
-                if match:
-
-                    st.success("🐄 MATCH FOUND!")
-
-                    st.subheader("Identified Cow Details")
-
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-                        st.write("**Cow ID:**", match["id"])
-                        st.write("**Cow Name:**", match["name"])
-                        st.write("**Feature Matches:**", score)
-
-                    with col2:
-
-                        if os.path.exists(match["image"]):
-
-                            st.image(
-                                match["image"],
-                                caption="Registered Cow",
-                                width=250
-                            )
-
-                else:
-
-                    st.error("No Matching Cow Found.")
-
-                    st.info(
-                        "Try capturing a clearer, well-lit image "
-                        "with the complete nose pattern visible."
-                    )
-
-                    st.write("Best feature match score:", score)
+                st.error("No Matching Cow Found.")
 
 
 # ---------------- REGISTERED RECORDS ----------------
@@ -368,15 +332,13 @@ with records_tab:
 
     st.header("Registered Cow Records")
 
+    st.write(f"**Total Registered Cows: {len(cows)}**")
+
     if not cows:
 
         st.info("No cows registered yet.")
 
     else:
-
-        st.write(
-            f"Total Registered Cows: {len(cows)}"
-        )
 
         for cow in cows:
 
@@ -384,11 +346,5 @@ with records_tab:
 
                 st.subheader(cow["name"])
 
-                st.write("**Cow ID:**", cow["id"])
+                display_cow_details(cow)
 
-                if os.path.exists(cow["image"]):
-
-                    st.image(
-                        cow["image"],
-                        width=200
-                    )
