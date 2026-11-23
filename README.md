@@ -23,7 +23,8 @@ It uses DINOv2 (`facebook/dinov2-small`) to extract image features and cosine si
 
 - Python
 - Streamlit
-- PyTorch and Torchvision
+- Streamlit-WebRTC (for continuous camera streaming; choose front/back camera before starting the stream)
+- PyTorch
 - Hugging Face Transformers
 - DINOv2
 - Pillow
@@ -92,7 +93,7 @@ The first run may take longer because the DINOv2 model needs to be downloaded.
 4. Cosine similarity is used to rank the image comparisons.
 5. The app displays the closest match according to its configured threshold.
 
-The threshold is a prototype setting and has not been scientifically calibrated. Performance can vary with image quality, lighting, camera angle and the images available in the records.
+The threshold is a prototype setting and has not been scientifically calibrated. Performance can vary with image quality, lighting, camera angle and the images available in the records. Live Auto Scan compares the central guide area; it does not include a dedicated cow-nose detector. Remote WebRTC streaming requires HTTPS and may require TURN configuration depending on the network.
 
 ## Live Demo
 
@@ -108,3 +109,8 @@ The threshold is a prototype setting and has not been scientifically calibrated.
 ## License
 
 No open-source license has been specified for this repository yet. Unless a license is added, the default copyright rules apply; please contact the repository owner before reusing or distributing this project.
+
+
+## Live camera controls update
+
+Live Auto Scan now uses the native camera/device controls from `streamlit-webrtc` (version 0.77.0 or newer). Start and stop are handled by the WebRTC component. While streaming, use the camera button's dropdown to switch between available front and rear cameras. When a match is confirmed, the app reruns without rendering the WebRTC component so the browser stream is released; the result remains visible until **START LIVE SCAN AGAIN** is pressed.
