@@ -1002,23 +1002,52 @@ with camera_tab:
                     live_state,
                 )
 
+                # Select the camera BEFORE opening the stream. On some Android
+                # browsers, switching deviceId while a WebRTC track is already
+                # active raises NotReadableError. A new component key per facing
+                # mode ensures the old browser stream is not reused.
+                camera_options = {
+                    "Back camera (recommended)": "environment",
+                    "Front camera": "user",
+                }
+                selected_camera_label = st.radio(
+                    "Choose Live Camera",
+                    list(camera_options.keys()),
+                    horizontal=True,
+                    key="live_camera_facing_choice",
+                    disabled=st.session_state.live_camera_enabled,
+                )
+                selected_facing_mode = camera_options[selected_camera_label]
+
+                if st.session_state.live_camera_enabled:
+                    st.caption(
+                        "To change cameras, stop Live Scan first, select the other camera, "
+                        "then press Start again."
+                    )
+                else:
+                    st.caption(
+                        "Choose Back camera or Front camera before starting. "
+                        "The camera is opened only after you press Start Live Scan."
+                    )
+
                 # The camera is controlled from our own Start/Stop buttons.
                 # A confirmed match switches this value to False, stopping the
                 # WebRTC camera; it remains off until the user starts again.
                 webrtc_context = webrtc_streamer(
-                    key="cow_nose_live_auto_scan",
+                    key=f"cow_nose_live_auto_scan_{selected_facing_mode}",
                     mode=WebRtcMode.SENDRECV,
                     rtc_configuration=get_live_rtc_configuration(),
-                    # Prefer the rear-facing camera on phones. Browsers can
-                    # fall back to another available camera if no rear camera exists.
+                    # Use the browser's facingMode constraint at initial capture
+                    # instead of changing an already-open camera track mid-stream.
                     media_stream_constraints={
-                        "video": {"facingMode": {"ideal": "environment"}},
+                        "video": {"facingMode": {"exact": selected_facing_mode}},
                         "audio": False,
                     },
                     video_frame_callback=video_callback,
                     desired_playing_state=st.session_state.live_camera_enabled,
-                    # Required for the camera device dropdown in streamlit-webrtc >= 0.77.
-                    media_toggle_controls=True,
+                    # Hide the in-stream device dropdown. Camera selection is
+                    # handled above before starting, avoiding mobile switch errors.
+                    media_toggle_controls=False,
                     async_processing=True,
                 )
 
