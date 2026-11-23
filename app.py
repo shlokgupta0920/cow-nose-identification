@@ -640,17 +640,14 @@ def get_live_rtc_configuration():
 
 @st.fragment(run_every=1)
 def render_live_scan_result(scan_state):
-    """Refresh scan status; request a full rerun when a match stops the camera."""
+    """Refresh live results; unmount the WebRTC component on a confirmed match."""
     result = scan_state.snapshot()
     status = result["status"]
 
     if status == "matched":
-        # desired_playing_state is applied by the parent app on a full rerun.
-        # Turn it off as soon as the callback reports a confirmed match.
-        if st.session_state.get("live_camera_enabled", False):
-            st.session_state.live_camera_enabled = False
-            st.rerun(scope="app")
-        st.success("Cow match found. Camera is stopping automatically...")
+        # A full app rerun makes the matched branch omit webrtc_streamer().
+        # Removing its component unmounts the browser stream and releases camera.
+        st.rerun(scope="app")
     elif status == "confirming":
         st.info(result["message"])
         st.metric("Current Similarity Score", f"{result['score'] * 100:.2f}%")
@@ -955,9 +952,9 @@ with camera_tab:
     else:
 
         st.write(
-            "Start the camera and place the cow nose inside the green guide. "
-            "The system will analyze frames automatically. On phones, use the "
-            "camera dropdown beside the camera control to switch between available cameras."
+            "Press START LIVE SCAN in the camera panel. During scanning, use "
+            "the camera button's dropdown to switch between the available "
+            "front and back cameras."
         )
 
         st.caption(
@@ -993,74 +990,25 @@ with camera_tab:
 
                 if "live_scan_state" not in st.session_state:
                     st.session_state.live_scan_state = LiveScanState()
-                if "live_camera_enabled" not in st.session_state:
-                    st.session_state.live_camera_enabled = False
+                if "live_scan_round" not in st.session_state:
+                    st.session_state.live_scan_round = 0
 
                 live_state = st.session_state.live_scan_state
-                video_callback = create_live_video_callback(
-                    live_references,
-                    live_state,
-                )
-
-                # Select the camera BEFORE opening the stream. On some Android
-                # browsers, switching deviceId while a WebRTC track is already
-                # active raises NotReadableError. A new component key per facing
-                # mode ensures the old browser stream is not reused.
-                camera_options = {
-                    "Back camera (recommended)": "environment",
-                    "Front camera": "user",
-                }
-                selected_camera_label = st.radio(
-                    "Choose Live Camera",
-                    list(camera_options.keys()),
-                    horizontal=True,
-                    key="live_camera_facing_choice",
-                    disabled=st.session_state.live_camera_enabled,
-                )
-                selected_facing_mode = camera_options[selected_camera_label]
-
-                if st.session_state.live_camera_enabled:
-                    st.caption(
-                        "To change cameras, stop Live Scan first, select the other camera, "
-                        "then press Start again."
-                    )
-                else:
-                    st.caption(
-                        "Choose Back camera or Front camera before starting. "
-                        "The camera is opened only after you press Start Live Scan."
-                    )
-
-                # The camera is controlled from our own Start/Stop buttons.
-                # A confirmed match switches this value to False, stopping the
-                # WebRTC camera; it remains off until the user starts again.
-                webrtc_context = webrtc_streamer(
-                    key=f"cow_nose_live_auto_scan_{selected_facing_mode}",
-                    mode=WebRtcMode.SENDRECV,
-                    rtc_configuration=get_live_rtc_configuration(),
-                    # Use the browser's facingMode constraint at initial capture
-                    # instead of changing an already-open camera track mid-stream.
-                    media_stream_constraints={
-                        "video": {"facingMode": {"exact": selected_facing_mode}},
-                        "audio": False,
-                    },
-                    video_frame_callback=video_callback,
-                    desired_playing_state=st.session_state.live_camera_enabled,
-                    # Hide the in-stream device dropdown. Camera selection is
-                    # handled above before starting, avoiding mobile switch errors.
-                    media_toggle_controls=False,
-                    async_processing=True,
-                )
-
                 current_result = live_state.snapshot()
 
                 if current_result["status"] == "matched":
-                    # Safety net in case this run observed the match before
-                    # the fragment requested the app-level rerun.
-                    if st.session_state.live_camera_enabled:
-                        st.session_state.live_camera_enabled = False
-                        st.rerun(scope="app")
-
+                    # Do not render webrtc_streamer in this branch. Its browser
+                    # component is therefore unmounted and the camera is released.
                     st.success("✅ COW MATCH FOUND — CAMERA STOPPED")
+                    st.success("AI Matching Cow Found!")
+                    st.metric(
+                        "AI Similarity Score",
+                        f"{current_result['score'] * 100:.2f}%",
+                    )
+                    st.caption(
+                        "Similarity score only; it is not a verified identification "
+                        "probability or accuracy percentage."
+                    )
                     show_match_details(
                         current_result["cow"],
                         current_result["score"],
@@ -1072,33 +1020,51 @@ with camera_tab:
                         type="primary",
                         key="restart_live_scan_after_match",
                     ):
-                        live_state.reset("Camera starting. Place the cow nose inside the guide.")
-                        st.session_state.live_camera_enabled = True
+                        live_state.reset(
+                            "Press START LIVE SCAN in the camera panel when ready."
+                        )
+                        # Give every new WebRTC session a fresh component key.
+                        st.session_state.live_scan_round += 1
                         st.rerun(scope="app")
 
-                elif st.session_state.live_camera_enabled:
+                else:
+                    video_callback = create_live_video_callback(
+                        live_references,
+                        live_state,
+                    )
+
+                    # Let streamlit-webrtc own the start/stop lifecycle. Its
+                    # built-in camera control exposes a device dropdown on
+                    # streamlit-webrtc >= 0.77, avoiding custom facingMode
+                    # getUserMedia restarts that can raise NotReadableError on Android.
+                    webrtc_context = webrtc_streamer(
+                        key=f"cow_nose_live_auto_scan_{st.session_state.live_scan_round}",
+                        mode=WebRtcMode.SENDRECV,
+                        rtc_configuration=get_live_rtc_configuration(),
+                        media_stream_constraints={"video": True, "audio": False},
+                        video_frame_callback=video_callback,
+                        media_toggle_controls=True,
+                        async_processing=True,
+                        translations={
+                            "start": "START LIVE SCAN",
+                            "stop": "STOP LIVE SCAN",
+                            "select_camera": "Switch camera",
+                        },
+                    )
+
                     if webrtc_context.state.playing:
                         st.success("Camera connected. Live auto scanning is active.")
                     else:
-                        st.info("Connecting to camera... Allow camera permission if requested.")
-
-                    if st.button("STOP LIVE SCAN", key="stop_live_scan_button"):
-                        st.session_state.live_camera_enabled = False
-                        live_state.reset("Live scanning stopped. Press START LIVE SCAN when ready.")
-                        st.rerun(scope="app")
+                        # Clear stale transient messages after a user manually stops.
+                        if live_state.snapshot()["status"] not in ("waiting", "matched"):
+                            live_state.reset(
+                                "Camera is OFF. Press START LIVE SCAN when ready."
+                            )
+                        st.info(
+                            "📷 Camera is OFF. Press START LIVE SCAN in the camera panel."
+                        )
 
                     render_live_scan_result(live_state)
-
-                else:
-                    st.info("📷 Camera is OFF. Press START LIVE SCAN when you are ready.")
-                    if st.button(
-                        "START LIVE SCAN",
-                        type="primary",
-                        key="start_live_scan_button",
-                    ):
-                        live_state.reset("Camera starting. Place the cow nose inside the guide.")
-                        st.session_state.live_camera_enabled = True
-                        st.rerun(scope="app")
 
 
 # =====================================================
