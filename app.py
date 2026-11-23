@@ -956,7 +956,8 @@ with camera_tab:
 
         st.write(
             "Start the camera and place the cow nose inside the green guide. "
-            "The system will analyze frames automatically."
+            "The system will analyze frames automatically. On phones, use the "
+            "camera dropdown beside the camera control to switch between available cameras."
         )
 
         st.caption(
@@ -1008,10 +1009,16 @@ with camera_tab:
                     key="cow_nose_live_auto_scan",
                     mode=WebRtcMode.SENDRECV,
                     rtc_configuration=get_live_rtc_configuration(),
-                    media_stream_constraints={"video": True, "audio": False},
+                    # Prefer the rear-facing camera on phones. Browsers can
+                    # fall back to another available camera if no rear camera exists.
+                    media_stream_constraints={
+                        "video": {"facingMode": {"ideal": "environment"}},
+                        "audio": False,
+                    },
                     video_frame_callback=video_callback,
                     desired_playing_state=st.session_state.live_camera_enabled,
-                    media_toggle_controls=False,
+                    # Required for the camera device dropdown in streamlit-webrtc >= 0.77.
+                    media_toggle_controls=True,
                     async_processing=True,
                 )
 
