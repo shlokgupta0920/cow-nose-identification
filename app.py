@@ -5,12 +5,29 @@ import json
 import hashlib
 import re
 import phonenumbers
+import time
+import threading
+import numpy as np
 
-from PIL import Image
+from PIL import Image, ImageDraw
 from io import BytesIO
 from pathlib import Path
 
-from ai_recognition import load_ai_model, compare_images
+from ai_recognition import load_ai_model, compare_images, extract_features
+
+# Live camera support is optional at import time. Install the dependency
+# from requirements.txt to enable the Live Auto Scan mode.
+try:
+    import av
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode
+    WEBRTC_AVAILABLE = True
+    WEBRTC_IMPORT_ERROR = ""
+except ImportError as import_error:
+    av = None
+    webrtc_streamer = None
+    WebRtcMode = None
+    WEBRTC_AVAILABLE = False
+    WEBRTC_IMPORT_ERROR = str(import_error)
 
 
 # =====================================================
@@ -28,8 +45,10 @@ IMAGE_FOLDER = "cow_images"
 
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
 
-# Initial threshold. Calibrate with real cow images.
-AI_THRESHOLD = 0.70
+# Conservative prototype settings. These must be calibrated with a labelled
+# validation set of genuine matches and non-matching cows before real use.
+AI_THRESHOLD = 0.75
+AI_MIN_COW_MARGIN = 0.06
 
 
 # =====================================================
@@ -204,43 +223,99 @@ def ai_similarity(image1, image2):
         return 0.0
 
 
+def rank_cow_matches(scored_references):
+    """Rank cows, not individual photos, so one unusually similar photo
+    cannot by itself dominate all other registered records.
+
+    Each item in scored_references is (reference_dict, cosine_score).
+    When a cow has multiple registered images, its score blends its best
+    score (70%) with its second-best score (30%).
+    """
+    grouped = {}
+
+    for reference, score in scored_references:
+        cow = reference["cow"]
+        cow_key = (
+            str(cow.get("id") or "").strip()
+            or str(cow.get("name") or "").strip()
+            or str(id(cow))
+        )
+
+        if cow_key not in grouped:
+            grouped[cow_key] = {
+                "cow": cow,
+                "cow_key": cow_key,
+                "scores": [],
+                "best_reference_score": -1.0,
+                "matched_image": reference.get("image_path"),
+            }
+
+        entry = grouped[cow_key]
+        score = float(score)
+        entry["scores"].append(score)
+
+        if score > entry["best_reference_score"]:
+            entry["best_reference_score"] = score
+            entry["matched_image"] = reference.get("image_path")
+
+    ranked = []
+    for entry in grouped.values():
+        ordered_scores = sorted(entry["scores"], reverse=True)
+        if len(ordered_scores) >= 2:
+            combined_score = (
+                0.70 * ordered_scores[0]
+                + 0.30 * ordered_scores[1]
+            )
+        else:
+            combined_score = ordered_scores[0]
+
+        ranked.append({
+            "cow": entry["cow"],
+            "cow_key": entry["cow_key"],
+            "score": combined_score,
+            "matched_image": entry["matched_image"],
+            "reference_count": len(ordered_scores),
+        })
+
+    return sorted(ranked, key=lambda item: item["score"], reverse=True)
+
+
 def identify_cow_ai(query_image, cows):
+    """Compare an image against registered cows and reject weak or ambiguous
+    matches using a minimum score and a best-vs-runner-up margin.
     """
-    Compares query image against every saved image
-    of every registered cow.
-
-    Returns the best matching cow and similarity.
-    """
-    best_cow = None
-    best_score = 0.0
-    best_image = None
-
+    scored_references = []
     query_image = query_image.convert("RGB")
 
     for cow in cows:
-        image_paths = get_cow_images(cow)
-
-        for image_path in image_paths:
+        for image_path in get_cow_images(cow):
             try:
-                registered_image = Image.open(image_path).convert("RGB")
+                with Image.open(image_path) as registered_image:
+                    score = ai_similarity(
+                        query_image,
+                        registered_image.convert("RGB")
+                    )
 
-                score = ai_similarity(
-                    query_image,
-                    registered_image
-                )
-
-                if score > best_score:
-                    best_score = score
-                    best_cow = cow
-                    best_image = image_path
+                scored_references.append(({
+                    "cow": cow,
+                    "image_path": image_path,
+                }, score))
 
             except Exception as error:
                 print(f"Could not process {image_path}: {error}")
 
-    if best_cow and best_score >= AI_THRESHOLD:
-        return best_cow, best_score, best_image
+    ranked = rank_cow_matches(scored_references)
+    if not ranked:
+        return None, 0.0, None
 
-    return None, best_score, best_image
+    best = ranked[0]
+    second_score = ranked[1]["score"] if len(ranked) > 1 else 0.0
+    margin = best["score"] - second_score
+
+    if best["score"] >= AI_THRESHOLD and margin >= AI_MIN_COW_MARGIN:
+        return best["cow"], best["score"], best["matched_image"]
+
+    return None, best["score"], best["matched_image"]
 
 
 def show_match_details(cow, score, matched_image):
@@ -250,6 +325,7 @@ def show_match_details(cow, score, matched_image):
         "AI Similarity Score",
         f"{score * 100:.2f}%"
     )
+    st.caption("Similarity score only; it is not a verified identification probability or accuracy percentage.")
 
     st.subheader("Registered Cow Details")
 
@@ -305,8 +381,289 @@ def run_ai_identification(uploaded_image, cows):
         )
 
         st.caption(
-            "The image did not reach the current AI matching threshold."
+            "No reliable match was accepted. The best cow must reach at least "
+            f"{AI_THRESHOLD * 100:.0f}% similarity and lead the second-best "
+            f"cow by at least {AI_MIN_COW_MARGIN * 100:.0f} percentage points. "
+            "These are provisional prototype settings, not validated accuracy limits."
         )
+
+
+# =====================================================
+# LIVE CAMERA SCAN HELPERS
+# =====================================================
+
+LIVE_SCAN_INTERVAL_SECONDS = 1.5
+LIVE_CONFIRMATION_FRAMES = 3
+LIVE_GUIDE_MARGIN = 0.15
+
+
+class LiveScanState:
+    """Thread-safe state shared by the WebRTC callback and Streamlit UI."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._data = {
+            "status": "waiting",
+            "cow": None,
+            "score": 0.0,
+            "matched_image": None,
+            "message": "Start the camera to begin scanning.",
+        }
+
+    def update(self, status, cow=None, score=0.0, matched_image=None, message=""):
+        with self._lock:
+            self._data = {
+                "status": status,
+                "cow": cow,
+                "score": float(score),
+                "matched_image": matched_image,
+                "message": message,
+            }
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self._data)
+
+    def reset(self, message="Start the camera to begin scanning."):
+        self.update("waiting", message=message)
+
+
+@st.cache_data(show_spinner=False)
+def get_cached_image_embedding(image_path, modified_time_ns):
+    """Extract and cache a registered image embedding until that file changes."""
+    with Image.open(image_path) as registered_image:
+        embedding = extract_features(registered_image.convert("RGB"))
+
+    return embedding.squeeze(0).detach().cpu().numpy().astype(np.float32)
+
+
+def prepare_live_reference_embeddings(cow_records):
+    """Prepare the registered nose embeddings once before live scanning."""
+    references = []
+
+    for cow in cow_records:
+        for image_path in get_cow_images(cow):
+            try:
+                file_stat = os.stat(image_path)
+                embedding = get_cached_image_embedding(
+                    image_path,
+                    file_stat.st_mtime_ns
+                )
+
+                references.append({
+                    "embedding": embedding,
+                    "cow": cow,
+                    "image_path": image_path,
+                })
+
+            except Exception as error:
+                print(f"Could not prepare live reference {image_path}: {error}")
+
+    return references
+
+
+def create_live_video_callback(reference_embeddings, scan_state):
+    """Build an interval-based WebRTC callback with repeated-match confirmation."""
+    last_scan_time = 0.0
+    previous_candidate_id = None
+    consecutive_matches = 0
+
+    def video_frame_callback(frame):
+        nonlocal last_scan_time, previous_candidate_id, consecutive_matches
+
+        frame_bgr = frame.to_ndarray(format="bgr24")
+        height, width = frame_bgr.shape[:2]
+
+        # The user should position the cow nose inside this central guide.
+        x0 = int(width * LIVE_GUIDE_MARGIN)
+        y0 = int(height * LIVE_GUIDE_MARGIN)
+        x1 = int(width * (1 - LIVE_GUIDE_MARGIN))
+        y1 = int(height * (1 - LIVE_GUIDE_MARGIN))
+
+        now = time.monotonic()
+        current_status = scan_state.snapshot()["status"]
+        # Once a match is accepted, keep the result visible until the user stops
+        # the camera. This prevents a later noisy frame from replacing the result.
+        if current_status != "matched" and now - last_scan_time >= LIVE_SCAN_INTERVAL_SECONDS:
+            last_scan_time = now
+
+            try:
+                if not reference_embeddings:
+                    scan_state.update(
+                        "error",
+                        message="No registered nose-image embeddings are available."
+                    )
+                else:
+                    # Compare only the central guide area to reduce background influence.
+                    nose_region_bgr = frame_bgr[y0:y1, x0:x1]
+                    nose_region_rgb = nose_region_bgr[:, :, ::-1].copy()
+                    query_image = Image.fromarray(nose_region_rgb).convert("RGB")
+
+                    query_embedding = extract_features(query_image)
+                    query_vector = (
+                        query_embedding.squeeze(0)
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32)
+                    )
+
+                    scored_references = []
+                    for reference in reference_embeddings:
+                        # DINOv2 embeddings are L2-normalized, so dot product
+                        # is equivalent to cosine similarity here.
+                        score = float(np.dot(query_vector, reference["embedding"]))
+                        score = max(-1.0, min(1.0, score))
+                        scored_references.append((reference, score))
+
+                    ranked = rank_cow_matches(scored_references)
+
+                    if ranked:
+                        best = ranked[0]
+                        second_score = ranked[1]["score"] if len(ranked) > 1 else 0.0
+                        display_score = max(0.0, min(1.0, best["score"]))
+                        score_margin = display_score - second_score
+
+                        if (
+                            display_score >= AI_THRESHOLD
+                            and score_margin >= AI_MIN_COW_MARGIN
+                        ):
+                            candidate_cow = best["cow"]
+                            candidate_id = best["cow_key"]
+
+                            if candidate_id == previous_candidate_id:
+                                consecutive_matches += 1
+                            else:
+                                previous_candidate_id = candidate_id
+                                consecutive_matches = 1
+
+                            if consecutive_matches >= LIVE_CONFIRMATION_FRAMES:
+                                scan_state.update(
+                                    "matched",
+                                    cow=candidate_cow,
+                                    score=display_score,
+                                    matched_image=best["matched_image"],
+                                    message=(
+                                        "The same cow passed the score and "
+                                        "best-vs-second-best checks in "
+                                        f"{LIVE_CONFIRMATION_FRAMES} consecutive scans."
+                                    ),
+                                )
+                            else:
+                                scan_state.update(
+                                    "confirming",
+                                    cow=candidate_cow,
+                                    score=display_score,
+                                    matched_image=best["matched_image"],
+                                    message=(
+                                        f"Possible match: {consecutive_matches}/"
+                                        f"{LIVE_CONFIRMATION_FRAMES} confirmations. "
+                                        "Keep the nose steady inside the guide."
+                                    ),
+                                )
+                        else:
+                            previous_candidate_id = None
+                            consecutive_matches = 0
+
+                            if display_score >= AI_THRESHOLD and score_margin < AI_MIN_COW_MARGIN:
+                                scan_state.update(
+                                    "ambiguous",
+                                    score=display_score,
+                                    message=(
+                                        "No reliable match: the top two cows are "
+                                        f"too close ({score_margin * 100:.1f}% score gap). "
+                                        "Adjust the nose position and scan again."
+                                    ),
+                                )
+                            else:
+                                scan_state.update(
+                                    "searching",
+                                    score=display_score,
+                                    message=(
+                                        "No reliable match yet. Best score "
+                                        f"{display_score * 100:.1f}%; required "
+                                        f"{AI_THRESHOLD * 100:.0f}% plus a clear "
+                                        "lead over the next cow."
+                                    ),
+                                )
+                    else:
+                        previous_candidate_id = None
+                        consecutive_matches = 0
+                        scan_state.update(
+                            "searching",
+                            score=0.0,
+                            message="No registered cow reference images are available.",
+                        )
+
+            except Exception as error:
+                previous_candidate_id = None
+                consecutive_matches = 0
+                scan_state.update(
+                    "error",
+                    message=f"Live scan error: {error}"
+                )
+
+        # Draw a simple framing guide on the returned preview.
+        preview_rgb = Image.fromarray(frame_bgr[:, :, ::-1].copy())
+        draw = ImageDraw.Draw(preview_rgb)
+        draw.rectangle((x0, y0, x1, y1), outline=(0, 220, 120), width=4)
+        preview_bgr = np.asarray(preview_rgb)[:, :, ::-1].copy()
+        return av.VideoFrame.from_ndarray(preview_bgr, format="bgr24")
+
+    return video_frame_callback
+
+
+def get_live_rtc_configuration():
+    """Use public STUN by default; optional TURN credentials can be added in Streamlit Secrets."""
+    ice_servers = [
+        {"urls": ["stun:stun.l.google.com:19302"]}
+    ]
+
+    try:
+        turn_url = st.secrets.get("TURN_SERVER_URL", "")
+        turn_username = st.secrets.get("TURN_SERVER_USERNAME", "")
+        turn_credential = st.secrets.get("TURN_SERVER_CREDENTIAL", "")
+
+        if turn_url and turn_username and turn_credential:
+            ice_servers.append({
+                "urls": [turn_url],
+                "username": turn_username,
+                "credential": turn_credential,
+            })
+    except Exception:
+        # Secrets are optional; STUN-only mode remains available for networks
+        # that do not require a TURN relay.
+        pass
+
+    return {"iceServers": ice_servers}
+
+
+@st.fragment(run_every=1)
+def render_live_scan_result(scan_state):
+    """Refresh scan status; request a full rerun when a match stops the camera."""
+    result = scan_state.snapshot()
+    status = result["status"]
+
+    if status == "matched":
+        # desired_playing_state is applied by the parent app on a full rerun.
+        # Turn it off as soon as the callback reports a confirmed match.
+        if st.session_state.get("live_camera_enabled", False):
+            st.session_state.live_camera_enabled = False
+            st.rerun(scope="app")
+        st.success("Cow match found. Camera is stopping automatically...")
+    elif status == "confirming":
+        st.info(result["message"])
+        st.metric("Current Similarity Score", f"{result['score'] * 100:.2f}%")
+    elif status == "searching":
+        st.info(result["message"])
+        st.metric("Best Similarity Score", f"{result['score'] * 100:.2f}%")
+    elif status == "ambiguous":
+        st.warning(result["message"])
+        st.metric("Best Similarity Score", f"{result['score'] * 100:.2f}%")
+    elif status == "error":
+        st.error(result["message"])
+    else:
+        st.info(result["message"])
 
 
 # =====================================================
@@ -555,34 +912,157 @@ with identify_tab:
 
 
 # =====================================================
-# CAMERA SCAN
+# CAMERA SCAN – TAKE PHOTO OR LIVE AUTO SCAN
 # =====================================================
 
 with camera_tab:
 
-    st.header("📷 AI Live Camera Scan")
+    st.header("📷 Cow Nose Camera Scanner")
 
-    st.write(
-        "Capture a cow nose image using your device camera."
+    scan_mode = st.radio(
+        "Choose Scan Mode",
+        ["Take Photo", "Live Auto Scan"],
+        horizontal=True,
+        key="camera_scan_mode",
     )
 
-    camera_image = st.camera_input(
-        "Capture Cow Nose Image"
-    )
+    if scan_mode == "Take Photo":
 
-    if camera_image:
-
-        st.image(
-            camera_image,
-            caption="Captured Nose Image",
-            width=300
+        st.write(
+            "Capture a cow nose image. The existing manual scan flow is unchanged."
         )
 
-        if st.button(
-            "Scan and Identify Cow",
-            type="primary"
-        ):
-            run_ai_identification(camera_image, cows)
+        camera_image = st.camera_input(
+            "Capture Cow Nose Image",
+            key="take_photo_camera",
+        )
+
+        if camera_image:
+
+            st.image(
+                camera_image,
+                caption="Captured Nose Image",
+                width=300
+            )
+
+            if st.button(
+                "Scan and Identify Cow",
+                type="primary",
+                key="take_photo_identify_button",
+            ):
+                run_ai_identification(camera_image, cows)
+
+    else:
+
+        st.write(
+            "Start the camera and place the cow nose inside the green guide. "
+            "The system will analyze frames automatically."
+        )
+
+        st.caption(
+            "Live mode scans the central guide area every 1.5 seconds. "
+            "A match requires at least 75% similarity, a 6-point lead over "
+            "the next cow, and the same candidate in 3 consecutive scans."
+        )
+
+        if not WEBRTC_AVAILABLE:
+            st.error(
+                "Live scanning dependency is not installed. Add streamlit-webrtc "
+                "to requirements.txt and redeploy. Details: " + WEBRTC_IMPORT_ERROR
+            )
+
+        elif not AI_READY:
+            st.error("AI model is not available. Check the model loading error above.")
+
+        elif not cows:
+            st.warning("Register at least one cow with nose images before live scanning.")
+
+        else:
+            with st.spinner("Preparing registered cow nose images for live scanning..."):
+                live_references = prepare_live_reference_embeddings(cows)
+
+            if not live_references:
+                st.warning(
+                    "No usable registered nose images were found. Check the cow_images folder."
+                )
+            else:
+                st.caption(
+                    f"Ready: {len(live_references)} registered nose-image reference(s) loaded."
+                )
+
+                if "live_scan_state" not in st.session_state:
+                    st.session_state.live_scan_state = LiveScanState()
+                if "live_camera_enabled" not in st.session_state:
+                    st.session_state.live_camera_enabled = False
+
+                live_state = st.session_state.live_scan_state
+                video_callback = create_live_video_callback(
+                    live_references,
+                    live_state,
+                )
+
+                # The camera is controlled from our own Start/Stop buttons.
+                # A confirmed match switches this value to False, stopping the
+                # WebRTC camera; it remains off until the user starts again.
+                webrtc_context = webrtc_streamer(
+                    key="cow_nose_live_auto_scan",
+                    mode=WebRtcMode.SENDRECV,
+                    rtc_configuration=get_live_rtc_configuration(),
+                    media_stream_constraints={"video": True, "audio": False},
+                    video_frame_callback=video_callback,
+                    desired_playing_state=st.session_state.live_camera_enabled,
+                    media_toggle_controls=False,
+                    async_processing=True,
+                )
+
+                current_result = live_state.snapshot()
+
+                if current_result["status"] == "matched":
+                    # Safety net in case this run observed the match before
+                    # the fragment requested the app-level rerun.
+                    if st.session_state.live_camera_enabled:
+                        st.session_state.live_camera_enabled = False
+                        st.rerun(scope="app")
+
+                    st.success("✅ COW MATCH FOUND — CAMERA STOPPED")
+                    show_match_details(
+                        current_result["cow"],
+                        current_result["score"],
+                        current_result["matched_image"],
+                    )
+
+                    if st.button(
+                        "START LIVE SCAN AGAIN",
+                        type="primary",
+                        key="restart_live_scan_after_match",
+                    ):
+                        live_state.reset("Camera starting. Place the cow nose inside the guide.")
+                        st.session_state.live_camera_enabled = True
+                        st.rerun(scope="app")
+
+                elif st.session_state.live_camera_enabled:
+                    if webrtc_context.state.playing:
+                        st.success("Camera connected. Live auto scanning is active.")
+                    else:
+                        st.info("Connecting to camera... Allow camera permission if requested.")
+
+                    if st.button("STOP LIVE SCAN", key="stop_live_scan_button"):
+                        st.session_state.live_camera_enabled = False
+                        live_state.reset("Live scanning stopped. Press START LIVE SCAN when ready.")
+                        st.rerun(scope="app")
+
+                    render_live_scan_result(live_state)
+
+                else:
+                    st.info("📷 Camera is OFF. Press START LIVE SCAN when you are ready.")
+                    if st.button(
+                        "START LIVE SCAN",
+                        type="primary",
+                        key="start_live_scan_button",
+                    ):
+                        live_state.reset("Camera starting. Place the cow nose inside the guide.")
+                        st.session_state.live_camera_enabled = True
+                        st.rerun(scope="app")
 
 
 # =====================================================
