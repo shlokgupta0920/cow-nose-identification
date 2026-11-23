@@ -604,7 +604,10 @@ with records_tab:
 
     else:
 
-        for cow in cows:
+        for cow_index, cow in enumerate(cows):
+
+            cow_id = str(cow.get("id", ""))
+            confirm_key = f"confirm_delete_cow_{cow_index}_{cow_id}"
 
             with st.container(border=True):
 
@@ -637,15 +640,90 @@ with records_tab:
 
                     image_cols = st.columns(4)
 
-                    for index, path in enumerate(image_paths):
+                    for image_index, path in enumerate(image_paths):
 
-                        with image_cols[index % 4]:
+                        with image_cols[image_index % 4]:
 
                             st.image(
                                 path,
-                                caption=f"Image {index + 1}",
+                                caption=f"Image {image_index + 1}",
                                 use_container_width=True
                             )
+
+                st.divider()
+
+                if st.session_state.get(confirm_key, False):
+
+                    st.warning(
+                        f"Are you sure you want to permanently delete "
+                        f"{cow.get('name', 'this cow')} (ID: {cow_id})?"
+                    )
+
+                    confirm_col, cancel_col = st.columns(2)
+
+                    with confirm_col:
+
+                        if st.button(
+                            "Yes, Delete Permanently",
+                            key=f"yes_delete_{cow_index}_{cow_id}",
+                            type="primary",
+                            use_container_width=True
+                        ):
+
+                            # Remove only the selected record.
+                            updated_cows = [
+                                item for item_index, item in enumerate(cows)
+                                if item_index != cow_index
+                            ]
+
+                            try:
+                                save_cows(updated_cows)
+
+                                # Delete only this cow's image files
+                                # located inside the cow_images directory.
+                                image_root = Path(IMAGE_FOLDER).resolve()
+
+                                for image_path in get_cow_images(cow):
+                                    try:
+                                        resolved_path = Path(image_path).resolve()
+
+                                        if (
+                                            resolved_path.is_relative_to(image_root)
+                                            and resolved_path.is_file()
+                                        ):
+                                            resolved_path.unlink()
+
+                                    except (OSError, ValueError):
+                                        pass
+
+                                st.session_state.pop(confirm_key, None)
+                                st.success(
+                                    f"Cow record {cow_id} deleted successfully."
+                                )
+                                st.rerun()
+
+                            except Exception as error:
+                                st.error(f"Could not delete record: {error}")
+
+                    with cancel_col:
+
+                        if st.button(
+                            "Cancel",
+                            key=f"cancel_delete_{cow_index}_{cow_id}",
+                            use_container_width=True
+                        ):
+                            st.session_state.pop(confirm_key, None)
+                            st.rerun()
+
+                else:
+
+                    if st.button(
+                        "🗑️ Delete Record",
+                        key=f"delete_cow_{cow_index}_{cow_id}",
+                        type="secondary"
+                    ):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
 
     st.divider()
 
